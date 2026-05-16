@@ -123,7 +123,7 @@ export default function Page() {
     velocity: number;
     t: number;
   } | null>(null);
-  const [sensitivity, setSensitivity] = useState<number>(18);
+  const [sensitivity, setSensitivity] = useState<number>(12);
   const [hits, setHits] = useState(0);
   const [calibrated, setCalibrated] = useState(false);
 
@@ -133,7 +133,7 @@ export default function Page() {
   const baselineYawRef = useRef<number | null>(null);
   const currentYawRef = useRef<number>(0);
   const activeZoneRef = useRef<Zone>("snare");
-  const sensitivityRef = useRef<number>(18);
+  const sensitivityRef = useRef<number>(12);
   const startTimeRef = useRef<number>(0);
 
   const tiltDotRef = useRef<HTMLDivElement | null>(null);
@@ -163,6 +163,10 @@ export default function Page() {
     playZone(ctx, zone, velocity);
     setHits((h) => h + 1);
     setLastHit({ zone, velocity, t: performance.now() });
+
+    if (typeof navigator !== "undefined" && navigator.vibrate) {
+      navigator.vibrate(15);
+    }
 
     // pulse ring
     const layer = flashLayerRef.current;
@@ -206,13 +210,20 @@ export default function Page() {
   );
 
   const handleOrientation = useCallback((e: DeviceOrientationEvent) => {
-    const gamma = e.gamma; // left/right tilt: -90 to 90
-    if (gamma == null) return;
-    currentYawRef.current = gamma;
+    // Prefer iOS webkitCompassHeading (true compass heading) — note it
+    // rotates opposite to alpha, so invert to match alpha's convention.
+    const webkitHeading = (e as unknown as { webkitCompassHeading?: number })
+      .webkitCompassHeading;
+    const alpha =
+      webkitHeading != null && !Number.isNaN(webkitHeading)
+        ? 360 - webkitHeading
+        : e.alpha;
+    if (alpha == null) return;
+    currentYawRef.current = alpha;
 
     const since = performance.now() - startTimeRef.current;
     if (baselineYawRef.current === null && since > 800) {
-      baselineYawRef.current = gamma;
+      baselineYawRef.current = alpha;
       setCalibrated(true);
     }
   }, []);
@@ -223,18 +234,24 @@ export default function Page() {
     const loop = () => {
       const baseline = baselineYawRef.current;
       const cur = currentYawRef.current;
-      const relative = baseline === null ? 0 : cur - baseline;
+      let relative = 0;
+      if (baseline !== null) {
+        relative = cur - baseline;
+        // Compass heading wraps at 360° — normalize to [-180, 180]
+        if (relative > 180) relative -= 360;
+        if (relative < -180) relative += 360;
+      }
 
-      // Map [-45, 45] -> [0, 100]
-      const pct = Math.max(0, Math.min(100, ((relative + 45) / 90) * 100));
+      // Map [-60, 60] -> [0, 100]
+      const pct = Math.max(0, Math.min(100, ((relative + 60) / 120) * 100));
       const dot = tiltDotRef.current;
       if (dot) dot.style.left = `${pct}%`;
       const lbl = tiltLabelRef.current;
       if (lbl) lbl.textContent = relative.toFixed(1);
 
       let nextZone: Zone = "snare";
-      if (relative < -15) nextZone = "hihat";
-      else if (relative > 15) nextZone = "tom";
+      if (relative < -30) nextZone = "hihat";
+      else if (relative > 30) nextZone = "tom";
 
       if (nextZone !== activeZoneRef.current) {
         activeZoneRef.current = nextZone;
@@ -439,7 +456,7 @@ export default function Page() {
           </div>
         </div>
         <div className="mt-1 font-mono text-[11px] text-zinc-500">
-          TILT <span ref={tiltLabelRef} className="text-zinc-300">0.0</span>°
+          AIM <span ref={tiltLabelRef} className="text-zinc-300">0.0</span>°
         </div>
       </section>
 
@@ -460,7 +477,7 @@ export default function Page() {
 
       <footer className="mt-3 text-center text-[10px] text-zinc-500 font-mono leading-relaxed z-10">
         ถือมือถือเหมือนถือไม้กลอง · สะบัดข้อมือลงเร็วๆ เพื่อตี ·
-        เอียงซ้าย/ขวาเปลี่ยนเสียง
+        ชี้แขนซ้าย/ขวา เปลี่ยนเสียง
       </footer>
     </main>
   );
@@ -495,7 +512,7 @@ function StartScreen({
         <p className="mt-5 font-mono text-sm text-zinc-300/90 leading-relaxed max-w-xs mx-auto">
           ถือมือถือเป็นไม้กลอง · สะบัดข้อมือเพื่อตี
           <br />
-          เอียงซ้าย/ขวา เปลี่ยนเสียง
+          ชี้แขนซ้าย/ขวา เปลี่ยนเสียง
         </p>
       </header>
 
