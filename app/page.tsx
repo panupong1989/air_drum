@@ -42,16 +42,23 @@ const HAND_EMOJI: Record<Hand, string> = {
 };
 
 const DEFAULT_POSITIONS_BY_HAND: Record<Hand, DrumPositions> = {
-  right: { snare: { angle: 0 }, hihat: { angle: -50 } },
-  left: { snare: { angle: 0 }, hihat: { angle: -25 } },
+  right: { snare: { angle: 0 }, hihat: { angle: -25 } },
+  left: { snare: { angle: 0 }, hihat: { angle: 25 } },
 };
+
+// EMA weight on each new gravity sample. Small alpha = heavy smoothing,
+// keeping a stable gravity estimate while wrist flicks pass through as
+// linear acceleration.
+const GRAVITY_ALPHA = 0.1;
+
+// Indicator bar range in degrees of relative roll (±this).
+const ROLL_RANGE_DEG = 60;
 
 function getNearestZone(currentAngle: number, positions: DrumPositions): Zone {
   let nearest: Zone = "snare";
   let minDist = Infinity;
   for (const zone of ZONES) {
-    let diff = Math.abs(currentAngle - positions[zone].angle);
-    if (diff > 180) diff = 360 - diff;
+    const diff = Math.abs(currentAngle - positions[zone].angle);
     if (diff < minDist) {
       minDist = diff;
       nearest = zone;
@@ -60,21 +67,11 @@ function getNearestZone(currentAngle: number, positions: DrumPositions): Zone {
   return nearest;
 }
 
-function angleToPct(angle: number): number {
-  return Math.max(0, Math.min(100, ((angle + 60) / 120) * 100));
-}
-
-// Circular mean — robust at the ±180° wrap (sin/cos averaging).
-function meanAngle(history: number[]): number {
-  if (history.length === 0) return 0;
-  let sumSin = 0;
-  let sumCos = 0;
-  for (const a of history) {
-    const rad = (a * Math.PI) / 180;
-    sumSin += Math.sin(rad);
-    sumCos += Math.cos(rad);
-  }
-  return (Math.atan2(sumSin, sumCos) * 180) / Math.PI;
+function rollToPct(roll: number): number {
+  return Math.max(
+    0,
+    Math.min(100, ((roll + ROLL_RANGE_DEG) / (ROLL_RANGE_DEG * 2)) * 100)
+  );
 }
 
 // ----- Drum synthesis (Web Audio API) -----
@@ -156,7 +153,7 @@ export default function Page() {
     velocity: number;
     t: number;
   } | null>(null);
-  const [sensitivity, setSensitivity] = useState<number>(12);
+  const [sensitivity, setSensitivity] = useState<number>(8);
   const [hits, setHits] = useState(0);
   const [calibrated, setCalibrated] = useState(false);
   const [sensorAlive, setSensorAlive] = useState(false);
@@ -165,24 +162,35 @@ export default function Page() {
   );
 
   const audioCtxRef = useRef<AudioContext | null>(null);
-  const lastTriggerRef = useRef<number>(0);
-  const accelHistoryRef = useRef<number[]>([]);
-  const baselineYawRef = useRef<number | null>(null);
-  const currentYawRef = useRef<number>(0);
-  const activeZoneRef = useRef<Zone>("snare");
-  const sensitivityRef = useRef<number>(12);
-  const drumPositionsRef = useRef<DrumPositions>(drumPositions);
+
+  // Gravity is isolated from accelerationIncludingGravity via an EMA so wrist
+  // flicks (which are linear acceleration) don't corrupt the roll estimate.
+  const gravityRef = useRef<{ x: number; y: number; z: number }>({
+    x: 0,
+    y: 0,
+    z: 0,
+  });
+  const gravityReadyRef = useRef<boolean>(false);
+  const currentRollRef = useRef<number>(0);
+  const baselineRollRef = useRef<number | null>(null);
   const sensorAliveRef = useRef<boolean>(false);
 
-  // Low-pass: last 4 raw relative angles -> circular mean.
-  const angleHistoryRef = useRef<number[]>([]);
-  const smoothedAngleRef = useRef<number>(0);
-  // Pre-trigger snapshot: smoothed angle samples with timestamps (~250ms ring).
-  const angleSnapshotRef = useRef<{ t: number; angle: number }[]>([]);
+  // Peak detection on linear acceleration magnitude.
+  const linAccelHistoryRef = useRef<number[]>([]);
+  const lastTriggerRef = useRef<number>(0);
+
+  // Pre-trigger ring: smoothed roll samples in the last ~250ms.
+  const rollSnapshotRef = useRef<{ t: number; roll: number }[]>([]);
+
+  // Mirrors for reading state inside long-lived handlers.
+  const activeZoneRef = useRef<Zone>("snare");
+  const sensitivityRef = useRef<number>(8);
+  const drumPositionsRef = useRef<DrumPositions>(drumPositions);
+  const modeRef = useRef<Mode>("start");
 
   const tiltDotRef = useRef<HTMLDivElement | null>(null);
   const tiltLabelRef = useRef<HTMLSpanElement | null>(null);
-  const rawAlphaLabelRef = useRef<HTMLSpanElement | null>(null);
+  const rawRollLabelRef = useRef<HTMLSpanElement | null>(null);
   const rafRef = useRef<number | null>(null);
   const flashLayerRef = useRef<HTMLDivElement | null>(null);
 
@@ -198,20 +206,22 @@ export default function Page() {
     drumPositionsRef.current = drumPositions;
   }, [drumPositions]);
 
+  useEffect(() => {
+    modeRef.current = mode;
+  }, [mode]);
+
   const recalibrate = useCallback(() => {
-    baselineYawRef.current = null;
+    baselineRollRef.current = null;
     setCalibrated(false);
-    angleHistoryRef.current = [];
-    angleSnapshotRef.current = [];
+    rollSnapshotRef.current = [];
     setMode("calibrate");
   }, []);
 
   const setZero = useCallback(() => {
     if (!sensorAliveRef.current) return;
-    baselineYawRef.current = currentYawRef.current;
+    baselineRollRef.current = currentRollRef.current;
     setCalibrated(true);
-    angleHistoryRef.current = [];
-    angleSnapshotRef.current = [];
+    rollSnapshotRef.current = [];
     const ctx = audioCtxRef.current;
     if (ctx) {
       if (ctx.state === "suspended") ctx.resume();
@@ -250,45 +260,84 @@ export default function Page() {
     (e: DeviceMotionEvent) => {
       const a = e.accelerationIncludingGravity;
       if (!a || a.x == null || a.y == null || a.z == null) return;
-      const mag = Math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
+      const rx = a.x;
+      const ry = a.y;
+      const rz = a.z;
 
-      const hist = accelHistoryRef.current;
+      // EMA-isolate gravity. Seed with first sample so it doesn't have to
+      // converge from (0,0,0).
+      const g = gravityRef.current;
+      if (!gravityReadyRef.current) {
+        g.x = rx;
+        g.y = ry;
+        g.z = rz;
+        gravityReadyRef.current = true;
+      } else {
+        g.x = GRAVITY_ALPHA * rx + (1 - GRAVITY_ALPHA) * g.x;
+        g.y = GRAVITY_ALPHA * ry + (1 - GRAVITY_ALPHA) * g.y;
+        g.z = GRAVITY_ALPHA * rz + (1 - GRAVITY_ALPHA) * g.z;
+      }
+
+      // Portrait roll from smoothed gravity. atan2(gx, gz):
+      //   roll  0  = held straight
+      //   roll >0  = tilted right
+      //   roll <0  = tilted left
+      const roll = (Math.atan2(g.x, g.z) * 180) / Math.PI;
+      currentRollRef.current = roll;
+
+      if (!sensorAliveRef.current) {
+        sensorAliveRef.current = true;
+        setSensorAlive(true);
+      }
+
+      // Linear acceleration = raw - gravity. Magnitude is clean of the ~9.8
+      // gravity offset, so the threshold scale is smaller than before.
+      const lx = rx - g.x;
+      const ly = ry - g.y;
+      const lz = rz - g.z;
+      const mag = Math.sqrt(lx * lx + ly * ly + lz * lz);
+
+      const hist = linAccelHistoryRef.current;
       hist.push(mag);
       if (hist.length > 8) hist.shift();
       const baseline =
         hist.reduce((s, v) => s + v, 0) / Math.max(1, hist.length);
-
       const delta = mag - baseline;
+
       const now = performance.now();
-      const sinceLast = now - lastTriggerRef.current;
+
+      const snap = rollSnapshotRef.current;
+      snap.push({ t: now, roll });
+      while (snap.length > 0 && now - snap[0].t > 250) snap.shift();
 
       if (
+        modeRef.current === "play" &&
+        baselineRollRef.current !== null &&
         delta > sensitivityRef.current &&
-        sinceLast > 90 &&
-        baselineYawRef.current !== null
+        now - lastTriggerRef.current > 90
       ) {
         lastTriggerRef.current = now;
-        const velocity = Math.min(1, delta / 35);
+        const velocity = Math.min(1, delta / 20);
 
-        // The wrist-flick warps alpha at the moment of impact, so use the
-        // smoothed angle from ~80ms before the spike to decide which zone.
+        // The flick itself warps roll briefly; the angle ~80ms earlier
+        // is what the user was actually aiming at.
         const target = now - 80;
-        const buf = angleSnapshotRef.current;
-        let preAngle = smoothedAngleRef.current;
-        if (buf.length > 0) {
-          let best = buf[0];
-          let bestDiff = Math.abs(buf[0].t - target);
-          for (let i = 1; i < buf.length; i++) {
-            const d = Math.abs(buf[i].t - target);
+        let preRoll = roll;
+        if (snap.length > 0) {
+          let best = snap[0];
+          let bestDiff = Math.abs(snap[0].t - target);
+          for (let i = 1; i < snap.length; i++) {
+            const d = Math.abs(snap[i].t - target);
             if (d < bestDiff) {
               bestDiff = d;
-              best = buf[i];
+              best = snap[i];
             }
           }
-          preAngle = best.angle;
+          preRoll = best.roll;
         }
 
-        const zone = getNearestZone(preAngle, drumPositionsRef.current);
+        const preRelative = preRoll - baselineRollRef.current;
+        const zone = getNearestZone(preRelative, drumPositionsRef.current);
         activeZoneRef.current = zone;
         setActiveZone(zone);
         triggerHit(zone, velocity);
@@ -297,53 +346,27 @@ export default function Page() {
     [triggerHit]
   );
 
-  const handleOrientation = useCallback((e: DeviceOrientationEvent) => {
-    const webkitHeading = (e as unknown as { webkitCompassHeading?: number })
-      .webkitCompassHeading;
-    const alpha =
-      webkitHeading != null && !Number.isNaN(webkitHeading)
-        ? 360 - webkitHeading
-        : e.alpha;
-    if (alpha == null) return;
-    currentYawRef.current = alpha;
-    if (!sensorAliveRef.current) {
-      sensorAliveRef.current = true;
-      setSensorAlive(true);
-    }
-  }, []);
+  const isPostStart = mode !== "start";
 
-  // rAF loop: smoothing, snapshot buffer, indicator, zone selection in play.
+  // rAF loop drives the indicator dot + numeric readouts; reads `mode` via
+  // ref so transitions between calibrate/play/setup don't restart it.
   useEffect(() => {
-    if (mode === "start") return;
+    if (!isPostStart) return;
     const loop = () => {
-      const rawLbl = rawAlphaLabelRef.current;
-      if (rawLbl) rawLbl.textContent = currentYawRef.current.toFixed(1);
+      const rawLbl = rawRollLabelRef.current;
+      if (rawLbl) rawLbl.textContent = currentRollRef.current.toFixed(1);
 
-      const baseline = baselineYawRef.current;
+      const baseline = baselineRollRef.current;
       if (baseline !== null) {
-        let rawRelative = currentYawRef.current - baseline;
-        if (rawRelative > 180) rawRelative -= 360;
-        if (rawRelative < -180) rawRelative += 360;
-
-        const histArr = angleHistoryRef.current;
-        histArr.push(rawRelative);
-        if (histArr.length > 4) histArr.shift();
-        const smoothed = meanAngle(histArr);
-        smoothedAngleRef.current = smoothed;
-
-        const now = performance.now();
-        const snap = angleSnapshotRef.current;
-        snap.push({ t: now, angle: smoothed });
-        while (snap.length > 0 && now - snap[0].t > 250) snap.shift();
-
-        const pct = angleToPct(smoothed);
+        const relative = currentRollRef.current - baseline;
+        const pct = rollToPct(relative);
         const dot = tiltDotRef.current;
         if (dot) dot.style.left = `${pct}%`;
         const lbl = tiltLabelRef.current;
-        if (lbl) lbl.textContent = smoothed.toFixed(1);
+        if (lbl) lbl.textContent = relative.toFixed(1);
 
-        if (mode === "play") {
-          const nextZone = getNearestZone(smoothed, drumPositionsRef.current);
+        if (modeRef.current === "play") {
+          const nextZone = getNearestZone(relative, drumPositionsRef.current);
           if (nextZone !== activeZoneRef.current) {
             activeZoneRef.current = nextZone;
             setActiveZone(nextZone);
@@ -361,19 +384,17 @@ export default function Page() {
     return () => {
       if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
     };
-  }, [mode]);
+  }, [isPostStart]);
 
+  // Motion listener stays mounted across calibrate/play/setup. Peak detection
+  // self-gates by `modeRef.current === "play"`.
   useEffect(() => {
-    if (mode === "start") return;
-    window.addEventListener("deviceorientation", handleOrientation);
-    if (mode === "play") {
-      window.addEventListener("devicemotion", handleMotion);
-    }
+    if (!isPostStart) return;
+    window.addEventListener("devicemotion", handleMotion);
     return () => {
-      window.removeEventListener("deviceorientation", handleOrientation);
       window.removeEventListener("devicemotion", handleMotion);
     };
-  }, [mode, handleMotion, handleOrientation]);
+  }, [isPostStart, handleMotion]);
 
   const startWithHand = useCallback(async (chosenHand: Hand) => {
     setPermError(null);
@@ -393,31 +414,21 @@ export default function Page() {
         src.start(0);
       }
 
+      // iOS 13+ gates DeviceMotionEvent behind requestPermission. Orientation
+      // permission is no longer needed since the pipeline is motion-only.
       const MotionAny = DeviceMotionEvent as unknown as {
-        requestPermission?: () => Promise<"granted" | "denied">;
-      };
-      const OrientAny = DeviceOrientationEvent as unknown as {
         requestPermission?: () => Promise<"granted" | "denied">;
       };
       const motionP: Promise<"granted" | "denied"> =
         typeof MotionAny.requestPermission === "function"
           ? MotionAny.requestPermission()
           : Promise.resolve("granted");
-      const orientP: Promise<"granted" | "denied"> =
-        typeof OrientAny.requestPermission === "function"
-          ? OrientAny.requestPermission()
-          : Promise.resolve("granted");
 
       const ctx = audioCtxRef.current;
       if (ctx && ctx.state === "suspended") await ctx.resume();
       const m = await motionP;
-      const o = await orientP;
       if (m !== "granted") {
         setPermError("Motion permission denied — กรุณาอนุญาตการเคลื่อนไหว");
-        return;
-      }
-      if (o !== "granted") {
-        setPermError("Orientation permission denied — กรุณาอนุญาตการหมุนทิศ");
         return;
       }
 
@@ -426,10 +437,12 @@ export default function Page() {
       setActiveZone("snare");
       setHits(0);
       setLastHit(null);
-      baselineYawRef.current = null;
+      baselineRollRef.current = null;
       setCalibrated(false);
-      angleHistoryRef.current = [];
-      angleSnapshotRef.current = [];
+      linAccelHistoryRef.current = [];
+      rollSnapshotRef.current = [];
+      gravityRef.current = { x: 0, y: 0, z: 0 };
+      gravityReadyRef.current = false;
       sensorAliveRef.current = false;
       setSensorAlive(false);
       setMode("calibrate");
@@ -440,10 +453,11 @@ export default function Page() {
   }, []);
 
   const handleSetDrumPosition = useCallback((zone: Zone) => {
-    if (baselineYawRef.current === null) return;
+    if (baselineRollRef.current === null) return;
+    const relative = currentRollRef.current - baselineRollRef.current;
     setDrumPositions((prev) => ({
       ...prev,
-      [zone]: { angle: smoothedAngleRef.current },
+      [zone]: { angle: relative },
     }));
     const ctx = audioCtxRef.current;
     if (ctx) {
@@ -490,7 +504,7 @@ export default function Page() {
         sensorAlive={sensorAlive}
         onSetZero={setZero}
         onCancel={exitToStart}
-        rawAlphaLabelRef={rawAlphaLabelRef}
+        rawRollLabelRef={rawRollLabelRef}
       />
     );
   }
@@ -518,7 +532,6 @@ export default function Page() {
     <main className="grid-bg relative h-[100dvh] w-full flex flex-col px-4 pb-4 pt-3 overflow-hidden">
       <div className="scanline" />
 
-      {/* Header */}
       <header className="flex items-center justify-between gap-2 z-10">
         <button
           onClick={exitToStart}
@@ -544,7 +557,6 @@ export default function Page() {
         </button>
       </header>
 
-      {/* Active Zone Display */}
       <section
         className="relative flex-1 mt-3 mb-3 rounded-2xl border-2 overflow-hidden"
         style={{
@@ -596,7 +608,7 @@ export default function Page() {
         </div>
       </section>
 
-      {/* AIM Indicator with markers for SNARE + HI-HAT */}
+      {/* ROLL indicator with SNARE + HI-HAT markers */}
       <section className="z-10">
         <div className="relative h-9 rounded-md border border-zinc-800 overflow-hidden bg-zinc-900/40">
           {ZONES.map((z) => {
@@ -607,7 +619,7 @@ export default function Page() {
                 key={z}
                 className="absolute top-0 bottom-0 w-1 -translate-x-1/2"
                 style={{
-                  left: `${angleToPct(pos.angle)}%`,
+                  left: `${rollToPct(pos.angle)}%`,
                   background: color,
                   boxShadow: `0 0 8px ${color}`,
                 }}
@@ -627,7 +639,7 @@ export default function Page() {
         </div>
         <div className="mt-1 font-mono text-[11px] flex justify-between">
           <span className="text-zinc-500">
-            AIM{" "}
+            ROLL{" "}
             <span ref={tiltLabelRef} className="text-zinc-300">
               0.0
             </span>
@@ -636,7 +648,6 @@ export default function Page() {
         </div>
       </section>
 
-      {/* Sensitivity slider */}
       <section className="mt-3 z-10">
         <div className="flex items-center justify-between font-mono text-xs text-zinc-400 mb-1">
           <span>SENSITIVITY</span>
@@ -644,15 +655,15 @@ export default function Page() {
         </div>
         <input
           type="range"
-          min={8}
-          max={35}
+          min={4}
+          max={20}
           value={sensitivity}
           onChange={(e) => setSensitivity(Number(e.target.value))}
         />
       </section>
 
       <footer className="mt-3 text-center text-[10px] text-zinc-500 font-mono leading-relaxed z-10">
-        สะบัดข้อมือลงเพื่อตี · ชี้ทิศเปลี่ยนเสียง · ⚙ ปรับตำแหน่งใน SETUP
+        สะบัดข้อมือลงเพื่อตี · เอียงเปลี่ยนเสียง · ⚙ ปรับตำแหน่งใน SETUP
       </footer>
     </main>
   );
@@ -812,17 +823,8 @@ function SetupScreen({
       </header>
 
       <p className="mt-3 font-mono text-[11px] text-zinc-400 leading-relaxed text-center z-10">
-        🎯 SET = ใช้ทิศปัจจุบันเป็นตำแหน่ง · 🔊 TEST = ฟังเสียงโดยไม่ต้องใช้ sensor
+        🎯 SET = ใช้มุมเอียงปัจจุบันเป็นตำแหน่ง · 🔊 TEST = ฟังเสียงโดยไม่ต้องใช้ sensor
       </p>
-
-      {!calibrated && (
-        <div
-          className="mt-2 font-mono text-[11px] text-center z-10"
-          style={{ color: "#fde047" }}
-        >
-          กำลังอ่านทิศ · SET จะใช้ได้เมื่อ calibrate เสร็จ (TEST ใช้ได้เลย)
-        </div>
-      )}
 
       <section className="flex-1 mt-3 flex flex-col gap-3 z-10 overflow-y-auto">
         {ZONES.map((zone) => {
@@ -882,7 +884,7 @@ function SetupScreen({
         })}
       </section>
 
-      {/* AIM bar with current direction + 2 zone markers */}
+      {/* ROLL bar with current tilt + 2 zone markers */}
       <section className="mt-3 z-10">
         <div className="relative h-9 rounded-md border border-zinc-800 overflow-hidden bg-zinc-900/40">
           {ZONES.map((z) => {
@@ -893,7 +895,7 @@ function SetupScreen({
                 key={z}
                 className="absolute top-0 bottom-0 w-1 -translate-x-1/2"
                 style={{
-                  left: `${angleToPct(p.angle)}%`,
+                  left: `${rollToPct(p.angle)}%`,
                   background: color,
                   boxShadow: `0 0 8px ${color}`,
                 }}
@@ -911,7 +913,7 @@ function SetupScreen({
           />
         </div>
         <div className="mt-1 font-mono text-[11px] text-zinc-500">
-          AIM{" "}
+          ROLL{" "}
           <span ref={tiltLabelRef} className="text-zinc-300">
             0.0
           </span>
@@ -942,13 +944,13 @@ function CalibrateScreen({
   sensorAlive,
   onSetZero,
   onCancel,
-  rawAlphaLabelRef,
+  rawRollLabelRef,
 }: {
   hand: Hand;
   sensorAlive: boolean;
   onSetZero: () => void;
   onCancel: () => void;
-  rawAlphaLabelRef: MutableRefObject<HTMLSpanElement | null>;
+  rawRollLabelRef: MutableRefObject<HTMLSpanElement | null>;
 }) {
   return (
     <main className="grid-bg relative h-[100dvh] w-full flex flex-col px-4 pb-4 pt-3 overflow-hidden">
@@ -1005,8 +1007,8 @@ function CalibrateScreen({
       </section>
 
       <div className="z-10 text-center font-mono text-[11px] text-zinc-500">
-        RAW α{" "}
-        <span ref={rawAlphaLabelRef} className="text-zinc-300">
+        ROLL{" "}
+        <span ref={rawRollLabelRef} className="text-zinc-300">
           0.0
         </span>
         °
@@ -1018,7 +1020,7 @@ function CalibrateScreen({
       </div>
 
       <footer className="mt-3 text-center text-[10px] text-zinc-500 font-mono leading-relaxed z-10">
-        ทิศนี้จะเป็น 0° · ทิศอื่นจะวัดจากทิศนี้ · กด RECAL ในเกมเพื่อตั้งใหม่
+        มุมเอียงนี้จะเป็น 0° · ทิศอื่นจะวัดจากมุมนี้ · กด RECAL เพื่อตั้งใหม่
       </footer>
     </main>
   );
