@@ -3,81 +3,53 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { MutableRefObject } from "react";
 
-type Zone = "hihat" | "snare" | "tom";
-type Mode = "start" | "setup" | "play";
-type DrumPosition = { angle: number; set: boolean };
+type Zone = "hihat" | "snare";
+type Hand = "left" | "right";
+type Mode = "start" | "play" | "setup";
+type DrumPosition = { angle: number };
 type DrumPositions = Record<Zone, DrumPosition>;
 
-const ZONES: Zone[] = ["hihat", "snare", "tom"];
+const ZONES: Zone[] = ["hihat", "snare"];
 
 const ZONE_LABEL: Record<Zone, string> = {
   hihat: "HI-HAT",
   snare: "SNARE",
-  tom: "TOM",
 };
 
 const ZONE_THAI: Record<Zone, string> = {
   hihat: "ไฮ-แฮต",
   snare: "สแนร์",
-  tom: "ทอม",
 };
 
 const ZONE_COLOR: Record<Zone, string> = {
   hihat: "#fde047",
   snare: "#f43f5e",
-  tom: "#38bdf8",
 };
 
 const ZONE_CODE: Record<Zone, string> = {
   hihat: "ZONE_HHT",
   snare: "ZONE_SNR",
-  tom: "ZONE_TOM",
 };
 
-const DEFAULT_POSITIONS: DrumPositions = {
-  hihat: { angle: -30, set: false },
-  snare: { angle: 0, set: false },
-  tom: { angle: 30, set: false },
+const HAND_LABEL: Record<Hand, string> = {
+  left: "LEFT HAND",
+  right: "RIGHT HAND",
 };
 
-const STORAGE_KEY = "airdrum_positions";
+const HAND_EMOJI: Record<Hand, string> = {
+  left: "🤚",
+  right: "✋",
+};
 
-function loadPositions(): DrumPositions {
-  if (typeof window === "undefined") return DEFAULT_POSITIONS;
-  try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) return DEFAULT_POSITIONS;
-    const parsed = JSON.parse(raw) as Partial<DrumPositions>;
-    const out: DrumPositions = {
-      hihat: { ...DEFAULT_POSITIONS.hihat },
-      snare: { ...DEFAULT_POSITIONS.snare },
-      tom: { ...DEFAULT_POSITIONS.tom },
-    };
-    for (const z of ZONES) {
-      const p = parsed[z];
-      if (
-        p &&
-        typeof p.angle === "number" &&
-        Number.isFinite(p.angle) &&
-        typeof p.set === "boolean"
-      ) {
-        out[z] = { angle: p.angle, set: p.set };
-      }
-    }
-    return out;
-  } catch {
-    return DEFAULT_POSITIONS;
-  }
-}
+const DEFAULT_POSITIONS_BY_HAND: Record<Hand, DrumPositions> = {
+  right: { snare: { angle: 0 }, hihat: { angle: -50 } },
+  left: { snare: { angle: 0 }, hihat: { angle: -25 } },
+};
 
 function getNearestZone(currentAngle: number, positions: DrumPositions): Zone {
-  // If user hasn't customized any drum, fall back to comparing against the
-  // default positions so play mode works out of the box.
-  const anySet = ZONES.some((z) => positions[z].set);
   let nearest: Zone = "snare";
   let minDist = Infinity;
   for (const zone of ZONES) {
-    if (anySet && !positions[zone].set) continue;
     let diff = Math.abs(currentAngle - positions[zone].angle);
     if (diff > 180) diff = 360 - diff;
     if (diff < minDist) {
@@ -90,6 +62,19 @@ function getNearestZone(currentAngle: number, positions: DrumPositions): Zone {
 
 function angleToPct(angle: number): number {
   return Math.max(0, Math.min(100, ((angle + 60) / 120) * 100));
+}
+
+// Circular mean — robust at the ±180° wrap (sin/cos averaging).
+function meanAngle(history: number[]): number {
+  if (history.length === 0) return 0;
+  let sumSin = 0;
+  let sumCos = 0;
+  for (const a of history) {
+    const rad = (a * Math.PI) / 180;
+    sumSin += Math.sin(rad);
+    sumCos += Math.cos(rad);
+  }
+  return (Math.atan2(sumSin, sumCos) * 180) / Math.PI;
 }
 
 // ----- Drum synthesis (Web Audio API) -----
@@ -153,31 +138,17 @@ function playSnare(ctx: AudioContext, t: number, velocity: number) {
   osc.stop(t + 0.14);
 }
 
-function playTom(ctx: AudioContext, t: number, velocity: number) {
-  const osc = ctx.createOscillator();
-  osc.type = "sine";
-  osc.frequency.setValueAtTime(160, t);
-  osc.frequency.exponentialRampToValueAtTime(55, t + 0.25);
-  const gain = ctx.createGain();
-  const peak = 0.9 * velocity;
-  gain.gain.setValueAtTime(peak, t);
-  gain.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
-  osc.connect(gain).connect(ctx.destination);
-  osc.start(t);
-  osc.stop(t + 0.32);
-}
-
 function playZone(ctx: AudioContext, zone: Zone, velocity: number) {
   const t = ctx.currentTime;
   if (zone === "hihat") playHiHat(ctx, t, velocity);
-  else if (zone === "snare") playSnare(ctx, t, velocity);
-  else playTom(ctx, t, velocity);
+  else playSnare(ctx, t, velocity);
 }
 
 // ----- Component -----
 
 export default function Page() {
   const [mode, setMode] = useState<Mode>("start");
+  const [hand, setHand] = useState<Hand>("right");
   const [permError, setPermError] = useState<string | null>(null);
   const [activeZone, setActiveZone] = useState<Zone>("snare");
   const [lastHit, setLastHit] = useState<{
@@ -188,8 +159,9 @@ export default function Page() {
   const [sensitivity, setSensitivity] = useState<number>(12);
   const [hits, setHits] = useState(0);
   const [calibrated, setCalibrated] = useState(false);
-  const [drumPositions, setDrumPositions] =
-    useState<DrumPositions>(loadPositions);
+  const [drumPositions, setDrumPositions] = useState<DrumPositions>(
+    DEFAULT_POSITIONS_BY_HAND.right
+  );
 
   const audioCtxRef = useRef<AudioContext | null>(null);
   const lastTriggerRef = useRef<number>(0);
@@ -201,12 +173,17 @@ export default function Page() {
   const startTimeRef = useRef<number>(0);
   const drumPositionsRef = useRef<DrumPositions>(drumPositions);
 
+  // Low-pass: last 4 raw relative angles -> circular mean.
+  const angleHistoryRef = useRef<number[]>([]);
+  const smoothedAngleRef = useRef<number>(0);
+  // Pre-trigger snapshot: smoothed angle samples with timestamps (~250ms ring).
+  const angleSnapshotRef = useRef<{ t: number; angle: number }[]>([]);
+
   const tiltDotRef = useRef<HTMLDivElement | null>(null);
   const tiltLabelRef = useRef<HTMLSpanElement | null>(null);
   const rafRef = useRef<number | null>(null);
   const flashLayerRef = useRef<HTMLDivElement | null>(null);
 
-  // Mirror state -> refs
   useEffect(() => {
     activeZoneRef.current = activeZone;
   }, [activeZone]);
@@ -215,21 +192,16 @@ export default function Page() {
     sensitivityRef.current = sensitivity;
   }, [sensitivity]);
 
-  // Persist drum positions + mirror to ref for use inside the rAF loop
   useEffect(() => {
     drumPositionsRef.current = drumPositions;
-    if (typeof window === "undefined") return;
-    try {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(drumPositions));
-    } catch {
-      // ignore quota / privacy-mode errors
-    }
   }, [drumPositions]);
 
   const recalibrate = useCallback(() => {
     baselineYawRef.current = null;
     setCalibrated(false);
     startTimeRef.current = performance.now();
+    angleHistoryRef.current = [];
+    angleSnapshotRef.current = [];
   }, []);
 
   const triggerHit = useCallback((zone: Zone, velocity: number) => {
@@ -278,15 +250,35 @@ export default function Page() {
       ) {
         lastTriggerRef.current = now;
         const velocity = Math.min(1, delta / 35);
-        triggerHit(activeZoneRef.current, velocity);
+
+        // The wrist-flick warps alpha at the moment of impact, so use the
+        // smoothed angle from ~80ms before the spike to decide which zone.
+        const target = now - 80;
+        const buf = angleSnapshotRef.current;
+        let preAngle = smoothedAngleRef.current;
+        if (buf.length > 0) {
+          let best = buf[0];
+          let bestDiff = Math.abs(buf[0].t - target);
+          for (let i = 1; i < buf.length; i++) {
+            const d = Math.abs(buf[i].t - target);
+            if (d < bestDiff) {
+              bestDiff = d;
+              best = buf[i];
+            }
+          }
+          preAngle = best.angle;
+        }
+
+        const zone = getNearestZone(preAngle, drumPositionsRef.current);
+        activeZoneRef.current = zone;
+        setActiveZone(zone);
+        triggerHit(zone, velocity);
       }
     },
     [triggerHit]
   );
 
   const handleOrientation = useCallback((e: DeviceOrientationEvent) => {
-    // iOS Safari exposes a true compass via webkitCompassHeading; it rotates
-    // opposite to e.alpha, so invert it to share one convention downstream.
     const webkitHeading = (e as unknown as { webkitCompassHeading?: number })
       .webkitCompassHeading;
     const alpha =
@@ -303,31 +295,45 @@ export default function Page() {
     }
   }, []);
 
-  // rAF loop — drives the indicator dot in both setup & play, plus zone
-  // selection in play.
+  // rAF loop: smoothing, snapshot buffer, indicator, zone selection in play.
   useEffect(() => {
     if (mode === "start") return;
     const loop = () => {
       const baseline = baselineYawRef.current;
-      let relative = 0;
       if (baseline !== null) {
-        relative = currentYawRef.current - baseline;
-        if (relative > 180) relative -= 360;
-        if (relative < -180) relative += 360;
-      }
+        let rawRelative = currentYawRef.current - baseline;
+        if (rawRelative > 180) rawRelative -= 360;
+        if (rawRelative < -180) rawRelative += 360;
 
-      const pct = angleToPct(relative);
-      const dot = tiltDotRef.current;
-      if (dot) dot.style.left = `${pct}%`;
-      const lbl = tiltLabelRef.current;
-      if (lbl) lbl.textContent = relative.toFixed(1);
+        const histArr = angleHistoryRef.current;
+        histArr.push(rawRelative);
+        if (histArr.length > 4) histArr.shift();
+        const smoothed = meanAngle(histArr);
+        smoothedAngleRef.current = smoothed;
 
-      if (mode === "play") {
-        const nextZone = getNearestZone(relative, drumPositionsRef.current);
-        if (nextZone !== activeZoneRef.current) {
-          activeZoneRef.current = nextZone;
-          setActiveZone(nextZone);
+        const now = performance.now();
+        const snap = angleSnapshotRef.current;
+        snap.push({ t: now, angle: smoothed });
+        while (snap.length > 0 && now - snap[0].t > 250) snap.shift();
+
+        const pct = angleToPct(smoothed);
+        const dot = tiltDotRef.current;
+        if (dot) dot.style.left = `${pct}%`;
+        const lbl = tiltLabelRef.current;
+        if (lbl) lbl.textContent = smoothed.toFixed(1);
+
+        if (mode === "play") {
+          const nextZone = getNearestZone(smoothed, drumPositionsRef.current);
+          if (nextZone !== activeZoneRef.current) {
+            activeZoneRef.current = nextZone;
+            setActiveZone(nextZone);
+          }
         }
+      } else {
+        const dot = tiltDotRef.current;
+        if (dot) dot.style.left = `50%`;
+        const lbl = tiltLabelRef.current;
+        if (lbl) lbl.textContent = "0.0";
       }
       rafRef.current = requestAnimationFrame(loop);
     };
@@ -337,7 +343,6 @@ export default function Page() {
     };
   }, [mode]);
 
-  // Sensor listeners — orientation in both setup & play, motion only in play.
   useEffect(() => {
     if (mode === "start") return;
     window.addEventListener("deviceorientation", handleOrientation);
@@ -350,10 +355,10 @@ export default function Page() {
     };
   }, [mode, handleMotion, handleOrientation]);
 
-  const enterMode = useCallback(async (target: "setup" | "play") => {
+  const startWithHand = useCallback(async (chosenHand: Hand) => {
     setPermError(null);
     try {
-      // 1) Unlock audio synchronously on first entry (iOS user-gesture rule).
+      // Unlock audio synchronously on first entry (iOS user-gesture rule).
       if (!audioCtxRef.current) {
         const Ctx =
           window.AudioContext ||
@@ -368,8 +373,6 @@ export default function Page() {
         src.start(0);
       }
 
-      // 2) Kick off permission requests synchronously so the iOS gesture is
-      //    still valid.
       const MotionAny = DeviceMotionEvent as unknown as {
         requestPermission?: () => Promise<"granted" | "denied">;
       };
@@ -398,10 +401,17 @@ export default function Page() {
         return;
       }
 
+      setHand(chosenHand);
+      setDrumPositions(DEFAULT_POSITIONS_BY_HAND[chosenHand]);
+      setActiveZone("snare");
+      setHits(0);
+      setLastHit(null);
       startTimeRef.current = performance.now();
       baselineYawRef.current = null;
       setCalibrated(false);
-      setMode(target);
+      angleHistoryRef.current = [];
+      angleSnapshotRef.current = [];
+      setMode("play");
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setPermError(`Init error: ${msg}`);
@@ -409,14 +419,10 @@ export default function Page() {
   }, []);
 
   const handleSetDrumPosition = useCallback((zone: Zone) => {
-    const baseline = baselineYawRef.current;
-    if (baseline === null) return;
-    let relative = currentYawRef.current - baseline;
-    if (relative > 180) relative -= 360;
-    if (relative < -180) relative += 360;
+    if (baselineYawRef.current === null) return;
     setDrumPositions((prev) => ({
       ...prev,
-      [zone]: { angle: relative, set: true },
+      [zone]: { angle: smoothedAngleRef.current },
     }));
     const ctx = audioCtxRef.current;
     if (ctx) {
@@ -428,43 +434,44 @@ export default function Page() {
     }
   }, []);
 
-  const handleResetDrumPosition = useCallback((zone: Zone) => {
-    setDrumPositions((prev) => ({
-      ...prev,
-      [zone]: { angle: DEFAULT_POSITIONS[zone].angle, set: false },
-    }));
+  const handleTestZone = useCallback((zone: Zone) => {
+    const ctx = audioCtxRef.current;
+    if (!ctx) return;
+    if (ctx.state === "suspended") ctx.resume();
+    playZone(ctx, zone, 0.8);
+    if (typeof navigator !== "undefined" && navigator.vibrate) {
+      navigator.vibrate(10);
+    }
   }, []);
 
-  const finishSetup = useCallback(() => {
-    // Preserve baseline so positions captured during setup stay meaningful.
-    setMode("play");
-  }, []);
-
-  const exitSetup = useCallback(() => {
+  const exitToStart = useCallback(() => {
     setMode("start");
+  }, []);
+
+  const enterSetup = useCallback(() => {
+    setMode("setup");
+  }, []);
+
+  const backToPlay = useCallback(() => {
+    setMode("play");
   }, []);
 
   // ----- Render -----
 
   if (mode === "start") {
-    return (
-      <StartScreen
-        onStart={() => enterMode("play")}
-        onSetup={() => enterMode("setup")}
-        permError={permError}
-      />
-    );
+    return <StartScreen onPick={startWithHand} permError={permError} />;
   }
 
   if (mode === "setup") {
     return (
       <SetupScreen
+        hand={hand}
         positions={drumPositions}
         calibrated={calibrated}
         onSet={handleSetDrumPosition}
-        onReset={handleResetDrumPosition}
-        onDone={finishSetup}
-        onCancel={exitSetup}
+        onTest={handleTestZone}
+        onBackToPlay={backToPlay}
+        onRecal={recalibrate}
         tiltDotRef={tiltDotRef}
         tiltLabelRef={tiltLabelRef}
       />
@@ -473,7 +480,6 @@ export default function Page() {
 
   const velocityPct = lastHit ? Math.round(lastHit.velocity * 100) : 0;
   const flashKey = lastHit ? lastHit.t : 0;
-  const allCustom = ZONES.every((z) => drumPositions[z].set);
 
   return (
     <main className="grid-bg relative h-[100dvh] w-full flex flex-col px-4 pb-4 pt-3 overflow-hidden">
@@ -481,24 +487,27 @@ export default function Page() {
 
       {/* Header */}
       <header className="flex items-center justify-between gap-2 z-10">
+        <button
+          onClick={exitToStart}
+          aria-label="Back to start"
+          className="font-mono text-sm w-9 h-9 border border-zinc-700 rounded hover:border-zinc-500 active:scale-95 transition"
+        >
+          ✕
+        </button>
         <div className="flex items-center gap-2 font-mono text-xs">
+          <span className="text-base leading-none">{HAND_EMOJI[hand]}</span>
           <span
-            className="inline-block w-2.5 h-2.5 rounded-full bg-snare blink-dot"
-            style={{ boxShadow: "0 0 10px #f43f5e" }}
-          />
-          <span className="tracking-widest font-bold">LIVE</span>
-        </div>
-        <div className="font-display text-sm tracking-wider">
-          HITS{" "}
-          <span style={{ color: ZONE_COLOR[activeZone] }}>
-            {String(hits).padStart(3, "0")}
+            className="tracking-widest font-bold"
+            style={{ color: ZONE_COLOR[activeZone] }}
+          >
+            {HAND_LABEL[hand]}
           </span>
         </div>
         <button
-          onClick={recalibrate}
+          onClick={enterSetup}
           className="font-mono text-xs px-3 py-1.5 border border-zinc-700 rounded hover:border-zinc-500 active:scale-95 transition"
         >
-          RECAL
+          ⚙ SETUP
         </button>
       </header>
 
@@ -541,6 +550,15 @@ export default function Page() {
           </span>
         </div>
         <div className="absolute bottom-3 right-4 font-mono text-xs text-zinc-400">
+          HITS{" "}
+          <span
+            className="font-bold"
+            style={{ color: ZONE_COLOR[activeZone] }}
+          >
+            {String(hits).padStart(3, "0")}
+          </span>
+        </div>
+        <div className="absolute top-3 right-4 font-mono text-[10px] text-zinc-500">
           {ZONE_CODE[activeZone]}
         </div>
 
@@ -561,16 +579,12 @@ export default function Page() {
                 className="w-2 h-2 rounded-full bg-hihat blink-dot"
                 style={{ animationDelay: "120ms" }}
               />
-              <span
-                className="w-2 h-2 rounded-full bg-tom blink-dot"
-                style={{ animationDelay: "240ms" }}
-              />
             </div>
           </div>
         )}
       </section>
 
-      {/* AIM Indicator with per-drum markers */}
+      {/* AIM Indicator with markers for SNARE + HI-HAT */}
       <section className="z-10">
         <div className="relative h-9 rounded-md border border-zinc-800 overflow-hidden bg-zinc-900/40">
           {ZONES.map((z) => {
@@ -584,7 +598,6 @@ export default function Page() {
                   left: `${angleToPct(pos.angle)}%`,
                   background: color,
                   boxShadow: `0 0 8px ${color}`,
-                  opacity: pos.set ? 1 : 0.5,
                 }}
                 aria-label={ZONE_LABEL[z]}
               />
@@ -608,9 +621,6 @@ export default function Page() {
             </span>
             °
           </span>
-          {!allCustom && (
-            <span className="text-zinc-600 tracking-wider">DEFAULT KIT</span>
-          )}
         </div>
       </section>
 
@@ -630,8 +640,7 @@ export default function Page() {
       </section>
 
       <footer className="mt-3 text-center text-[10px] text-zinc-500 font-mono leading-relaxed z-10">
-        ถือมือถือเหมือนถือไม้กลอง · สะบัดข้อมือลงเร็วๆ เพื่อตี ·
-        ชี้แขนซ้าย/ขวา เปลี่ยนเสียง · RECAL = รีเซ็ตทิศปัจจุบัน
+        สะบัดข้อมือลงเพื่อตี · ชี้ทิศเปลี่ยนเสียง · ⚙ ปรับตำแหน่งใน SETUP
       </footer>
     </main>
   );
@@ -640,12 +649,10 @@ export default function Page() {
 // ----- Start Screen -----
 
 function StartScreen({
-  onStart,
-  onSetup,
+  onPick,
   permError,
 }: {
-  onStart: () => void;
-  onSetup: () => void;
+  onPick: (hand: Hand) => void;
   permError: string | null;
 }) {
   return (
@@ -655,7 +662,10 @@ function StartScreen({
       <header className="mt-6 text-center z-10">
         <h1
           className="font-display leading-none"
-          style={{ fontSize: "clamp(56px, 18vw, 120px)", letterSpacing: "0.04em" }}
+          style={{
+            fontSize: "clamp(56px, 18vw, 120px)",
+            letterSpacing: "0.04em",
+          }}
         >
           <span style={{ color: "#fde047", textShadow: "0 0 24px #fde04788" }}>
             AIR
@@ -666,200 +676,205 @@ function StartScreen({
           </span>
         </h1>
         <p className="mt-5 font-mono text-sm text-zinc-300/90 leading-relaxed max-w-xs mx-auto">
-          ถือมือถือเป็นไม้กลอง · สะบัดข้อมือเพื่อตี
+          มือถือ 1 เครื่อง = ไม้กลอง 1 ข้าง
           <br />
-          ชี้แขนซ้าย/ขวา เปลี่ยนเสียง
+          เลือกว่าเครื่องนี้ถือมือไหน
         </p>
       </header>
 
-      <section className="grid grid-cols-3 gap-3 w-full max-w-sm z-10">
-        <ZonePreview color="#fde047" label="HI-HAT" sub="← ซ้าย" />
-        <ZonePreview color="#f43f5e" label="SNARE" sub="● กลาง" />
-        <ZonePreview color="#38bdf8" label="TOM" sub="ขวา →" />
+      <section className="grid grid-cols-2 gap-4 w-full max-w-md z-10">
+        <HandButton
+          color="#fde047"
+          emoji="🤚"
+          label="LEFT"
+          sub="HAND"
+          onClick={() => onPick("left")}
+        />
+        <HandButton
+          color="#f43f5e"
+          emoji="✋"
+          label="RIGHT"
+          sub="HAND"
+          onClick={() => onPick("right")}
+        />
       </section>
 
-      <div className="flex flex-col items-center gap-4 z-10">
-        <button
-          onClick={onStart}
-          className="font-display text-2xl tracking-widest w-44 h-44 rounded-full border-4 active:scale-95 transition"
-          style={{
-            borderColor: "#f43f5e",
-            color: "#f43f5e",
-            boxShadow:
-              "0 0 50px rgba(244,63,94,0.65), inset 0 0 30px rgba(244,63,94,0.25)",
-            background: "radial-gradient(circle, #f43f5e22, transparent 70%)",
-          }}
-        >
-          ▶ START
-        </button>
-        <button
-          onClick={onSetup}
-          className="font-mono text-xs tracking-widest px-5 py-2.5 border border-zinc-600 rounded text-zinc-300 hover:border-zinc-400 hover:text-zinc-100 active:scale-95 transition"
-        >
-          ⚙ SETUP DRUMS
-        </button>
+      <div className="flex flex-col items-center gap-3 z-10 min-h-[64px]">
         {permError && (
           <div className="font-mono text-xs text-rose-400 text-center max-w-xs">
             {permError}
           </div>
         )}
+        <footer className="font-mono text-[10px] text-zinc-500 text-center leading-relaxed">
+          แนะนำ: iOS ต้องอนุญาต Motion · ใส่หูฟังให้ฟีลดี
+        </footer>
       </div>
-
-      <footer className="font-mono text-[10px] text-zinc-500 text-center leading-relaxed z-10">
-        แนะนำ: เปิดบนมือถือ · iOS ต้องอนุญาต Motion · ใส่หูฟังให้ฟีลดี
-      </footer>
     </main>
   );
 }
 
-function ZonePreview({
+function HandButton({
   color,
+  emoji,
   label,
   sub,
+  onClick,
 }: {
   color: string;
+  emoji: string;
   label: string;
   sub: string;
+  onClick: () => void;
 }) {
   return (
-    <div
-      className="rounded-xl border-2 p-3 text-center"
+    <button
+      onClick={onClick}
+      className="aspect-square rounded-2xl border-4 flex flex-col items-center justify-center gap-2 active:scale-95 transition"
       style={{
         borderColor: color,
-        background: `radial-gradient(circle, ${color}22, transparent 70%)`,
-        boxShadow: `0 0 16px ${color}55, inset 0 0 12px ${color}33`,
+        color,
+        boxShadow: `0 0 36px ${color}66, inset 0 0 24px ${color}33`,
+        background: `radial-gradient(circle, ${color}22, transparent 75%)`,
       }}
     >
+      <div className="text-6xl leading-none">{emoji}</div>
       <div
-        className="font-display text-base tracking-wider"
-        style={{ color, textShadow: `0 0 10px ${color}AA` }}
+        className="font-display text-2xl tracking-widest leading-none"
+        style={{ textShadow: `0 0 12px ${color}AA` }}
       >
         {label}
       </div>
-      <div className="font-mono text-[10px] text-zinc-300/80 mt-1">{sub}</div>
-    </div>
+      <div className="font-mono text-[11px] tracking-widest opacity-80">
+        {sub}
+      </div>
+    </button>
   );
 }
 
-// ----- Setup Screen -----
+// ----- Setup + Test Screen -----
 
 function SetupScreen({
+  hand,
   positions,
   calibrated,
   onSet,
-  onReset,
-  onDone,
-  onCancel,
+  onTest,
+  onBackToPlay,
+  onRecal,
   tiltDotRef,
   tiltLabelRef,
 }: {
+  hand: Hand;
   positions: DrumPositions;
   calibrated: boolean;
   onSet: (zone: Zone) => void;
-  onReset: (zone: Zone) => void;
-  onDone: () => void;
-  onCancel: () => void;
+  onTest: (zone: Zone) => void;
+  onBackToPlay: () => void;
+  onRecal: () => void;
   tiltDotRef: MutableRefObject<HTMLDivElement | null>;
   tiltLabelRef: MutableRefObject<HTMLSpanElement | null>;
 }) {
-  const allSet = ZONES.every((z) => positions[z].set);
   return (
     <main className="grid-bg relative h-[100dvh] w-full flex flex-col px-4 pb-4 pt-3 overflow-hidden">
       <div className="scanline" />
 
       <header className="flex items-center justify-between gap-2 z-10">
+        <button
+          onClick={onBackToPlay}
+          className="font-mono text-xs px-3 py-1.5 border border-zinc-700 rounded hover:border-zinc-500 active:scale-95 transition"
+        >
+          ◂ BACK
+        </button>
         <div
-          className="font-display text-lg tracking-widest"
+          className="font-display text-base tracking-widest text-center"
           style={{ color: "#fde047", textShadow: "0 0 12px #fde04788" }}
         >
-          SETUP YOUR KIT
+          SETUP · {HAND_LABEL[hand]}
         </div>
         <button
-          onClick={onCancel}
-          className="font-mono text-sm w-9 h-9 border border-zinc-700 rounded hover:border-zinc-500 active:scale-95 transition"
-          aria-label="Cancel setup"
+          onClick={onRecal}
+          className="font-mono text-xs px-3 py-1.5 border border-zinc-700 rounded hover:border-zinc-500 active:scale-95 transition"
         >
-          ✕
+          RECAL
         </button>
       </header>
 
       <p className="mt-3 font-mono text-[11px] text-zinc-400 leading-relaxed text-center z-10">
-        ชี้มือถือไปทิศที่ต้องการให้กลองอยู่ · แล้วกดปุ่มของกลองใบนั้น
+        🎯 SET = ใช้ทิศปัจจุบันเป็นตำแหน่ง · 🔊 TEST = ฟังเสียงโดยไม่ต้องใช้ sensor
       </p>
 
-      <section className="flex-1 mt-4 flex flex-col gap-3 z-10 overflow-y-auto">
+      {!calibrated && (
+        <div
+          className="mt-2 font-mono text-[11px] text-center z-10"
+          style={{ color: "#fde047" }}
+        >
+          กำลังอ่านทิศ · SET จะใช้ได้เมื่อ calibrate เสร็จ (TEST ใช้ได้เลย)
+        </div>
+      )}
+
+      <section className="flex-1 mt-3 flex flex-col gap-3 z-10 overflow-y-auto">
         {ZONES.map((zone) => {
           const pos = positions[zone];
           const color = ZONE_COLOR[zone];
           return (
             <div
               key={zone}
-              className="rounded-xl border-2 p-4 flex items-center justify-between transition"
+              className="rounded-xl border-2 p-4 transition"
               style={{
-                borderColor: pos.set ? color : "#3f3f46",
-                background: pos.set
-                  ? `radial-gradient(ellipse at center, ${color}22 0%, transparent 75%)`
-                  : "rgba(24,24,27,0.4)",
-                boxShadow: pos.set
-                  ? `0 0 18px ${color}33, inset 0 0 12px ${color}1f`
-                  : "none",
+                borderColor: color,
+                background: `radial-gradient(ellipse at center, ${color}1a 0%, transparent 75%)`,
+                boxShadow: `0 0 14px ${color}26, inset 0 0 12px ${color}1a`,
               }}
             >
-              <div>
-                <div
-                  className="font-display text-2xl tracking-wider flex items-center gap-2"
-                  style={{
-                    color: pos.set ? color : "#a1a1aa",
-                    textShadow: pos.set ? `0 0 10px ${color}AA` : "none",
-                  }}
-                >
-                  {pos.set && <span>✓</span>}
-                  {ZONE_LABEL[zone]}
-                </div>
-                <div
-                  className="font-mono text-[11px] mt-0.5"
-                  style={{ color: pos.set ? `${color}CC` : "#71717a" }}
-                >
-                  {ZONE_THAI[zone]}
-                  {pos.set && (
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div
+                    className="font-display text-2xl tracking-wider"
+                    style={{ color, textShadow: `0 0 10px ${color}AA` }}
+                  >
+                    {ZONE_LABEL[zone]}
+                  </div>
+                  <div
+                    className="font-mono text-[11px] mt-0.5"
+                    style={{ color: `${color}CC` }}
+                  >
+                    {ZONE_THAI[zone]}
                     <span className="ml-2 text-zinc-200 font-bold">
                       {pos.angle.toFixed(0)}°
                     </span>
-                  )}
+                  </div>
+                </div>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => onTest(zone)}
+                    className="font-mono text-xs tracking-wider px-3 py-2.5 rounded border border-zinc-600 text-zinc-200 hover:border-zinc-400 active:scale-95 transition"
+                  >
+                    🔊 TEST
+                  </button>
+                  <button
+                    onClick={() => onSet(zone)}
+                    disabled={!calibrated}
+                    className="font-mono text-xs tracking-wider px-3 py-2.5 rounded border-2 active:scale-95 transition disabled:opacity-30 disabled:cursor-not-allowed"
+                    style={{
+                      borderColor: color,
+                      color,
+                      boxShadow: calibrated ? `0 0 12px ${color}55` : "none",
+                    }}
+                  >
+                    🎯 SET
+                  </button>
                 </div>
               </div>
-              {pos.set ? (
-                <button
-                  onClick={() => onReset(zone)}
-                  className="font-mono text-xs px-3 py-2 border border-zinc-700 rounded hover:border-zinc-500 active:scale-95 transition"
-                >
-                  RESET
-                </button>
-              ) : (
-                <button
-                  onClick={() => onSet(zone)}
-                  disabled={!calibrated}
-                  className="font-mono text-xs tracking-wider px-4 py-2.5 rounded border-2 active:scale-95 transition disabled:opacity-30 disabled:cursor-not-allowed"
-                  style={{
-                    borderColor: color,
-                    color,
-                    boxShadow: calibrated ? `0 0 12px ${color}55` : "none",
-                  }}
-                >
-                  SET ▸
-                </button>
-              )}
             </div>
           );
         })}
       </section>
 
-      {/* AIM bar with markers for already-set drums */}
+      {/* AIM bar with current direction + 2 zone markers */}
       <section className="mt-3 z-10">
         <div className="relative h-9 rounded-md border border-zinc-800 overflow-hidden bg-zinc-900/40">
           {ZONES.map((z) => {
             const p = positions[z];
-            if (!p.set) return null;
             const color = ZONE_COLOR[z];
             return (
               <div
@@ -893,47 +908,17 @@ function SetupScreen({
       </section>
 
       <button
-        onClick={onDone}
-        disabled={!allSet}
-        className="mt-4 w-full py-4 font-display text-xl tracking-widest rounded border-2 active:scale-95 transition disabled:opacity-30 disabled:border-zinc-700 disabled:text-zinc-500 disabled:cursor-not-allowed"
-        style={
-          allSet
-            ? {
-                borderColor: "#f43f5e",
-                color: "#f43f5e",
-                boxShadow: "0 0 24px rgba(244,63,94,0.5)",
-                background: "radial-gradient(circle, #f43f5e22, transparent 70%)",
-              }
-            : undefined
-        }
+        onClick={onBackToPlay}
+        className="mt-4 w-full py-4 font-display text-xl tracking-widest rounded border-2 active:scale-95 transition"
+        style={{
+          borderColor: "#f43f5e",
+          color: "#f43f5e",
+          boxShadow: "0 0 24px rgba(244,63,94,0.5)",
+          background: "radial-gradient(circle, #f43f5e22, transparent 70%)",
+        }}
       >
-        DONE
+        BACK TO PLAY
       </button>
-
-      {!calibrated && (
-        <div className="absolute inset-0 z-30 backdrop-blur-md bg-black/70 flex flex-col items-center justify-center">
-          <div
-            className="font-display text-2xl tracking-widest"
-            style={{ color: "#fde047" }}
-          >
-            CALIBRATING
-          </div>
-          <div className="mt-2 font-mono text-xs text-zinc-400 text-center px-6">
-            ถือมือถือให้นิ่งในท่าที่จะเล่น
-          </div>
-          <div className="mt-4 flex gap-1">
-            <span className="w-2 h-2 rounded-full bg-snare blink-dot" />
-            <span
-              className="w-2 h-2 rounded-full bg-hihat blink-dot"
-              style={{ animationDelay: "120ms" }}
-            />
-            <span
-              className="w-2 h-2 rounded-full bg-tom blink-dot"
-              style={{ animationDelay: "240ms" }}
-            />
-          </div>
-        </div>
-      )}
     </main>
   );
 }
