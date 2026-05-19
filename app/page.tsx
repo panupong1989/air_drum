@@ -5,7 +5,7 @@ import type { MutableRefObject } from "react";
 
 type Zone = "hihat" | "snare";
 type Hand = "left" | "right";
-type Mode = "start" | "play" | "setup";
+type Mode = "start" | "calibrate" | "play" | "setup";
 type DrumPosition = { angle: number };
 type DrumPositions = Record<Zone, DrumPosition>;
 
@@ -159,6 +159,7 @@ export default function Page() {
   const [sensitivity, setSensitivity] = useState<number>(12);
   const [hits, setHits] = useState(0);
   const [calibrated, setCalibrated] = useState(false);
+  const [sensorAlive, setSensorAlive] = useState(false);
   const [drumPositions, setDrumPositions] = useState<DrumPositions>(
     DEFAULT_POSITIONS_BY_HAND.right
   );
@@ -170,8 +171,8 @@ export default function Page() {
   const currentYawRef = useRef<number>(0);
   const activeZoneRef = useRef<Zone>("snare");
   const sensitivityRef = useRef<number>(12);
-  const startTimeRef = useRef<number>(0);
   const drumPositionsRef = useRef<DrumPositions>(drumPositions);
+  const sensorAliveRef = useRef<boolean>(false);
 
   // Low-pass: last 4 raw relative angles -> circular mean.
   const angleHistoryRef = useRef<number[]>([]);
@@ -181,6 +182,7 @@ export default function Page() {
 
   const tiltDotRef = useRef<HTMLDivElement | null>(null);
   const tiltLabelRef = useRef<HTMLSpanElement | null>(null);
+  const rawAlphaLabelRef = useRef<HTMLSpanElement | null>(null);
   const rafRef = useRef<number | null>(null);
   const flashLayerRef = useRef<HTMLDivElement | null>(null);
 
@@ -199,9 +201,26 @@ export default function Page() {
   const recalibrate = useCallback(() => {
     baselineYawRef.current = null;
     setCalibrated(false);
-    startTimeRef.current = performance.now();
     angleHistoryRef.current = [];
     angleSnapshotRef.current = [];
+    setMode("calibrate");
+  }, []);
+
+  const setZero = useCallback(() => {
+    if (!sensorAliveRef.current) return;
+    baselineYawRef.current = currentYawRef.current;
+    setCalibrated(true);
+    angleHistoryRef.current = [];
+    angleSnapshotRef.current = [];
+    const ctx = audioCtxRef.current;
+    if (ctx) {
+      if (ctx.state === "suspended") ctx.resume();
+      playSnare(ctx, ctx.currentTime, 0.7);
+    }
+    if (typeof navigator !== "undefined" && navigator.vibrate) {
+      navigator.vibrate(25);
+    }
+    setMode("play");
   }, []);
 
   const triggerHit = useCallback((zone: Zone, velocity: number) => {
@@ -287,11 +306,9 @@ export default function Page() {
         : e.alpha;
     if (alpha == null) return;
     currentYawRef.current = alpha;
-
-    const since = performance.now() - startTimeRef.current;
-    if (baselineYawRef.current === null && since > 800) {
-      baselineYawRef.current = alpha;
-      setCalibrated(true);
+    if (!sensorAliveRef.current) {
+      sensorAliveRef.current = true;
+      setSensorAlive(true);
     }
   }, []);
 
@@ -299,6 +316,9 @@ export default function Page() {
   useEffect(() => {
     if (mode === "start") return;
     const loop = () => {
+      const rawLbl = rawAlphaLabelRef.current;
+      if (rawLbl) rawLbl.textContent = currentYawRef.current.toFixed(1);
+
       const baseline = baselineYawRef.current;
       if (baseline !== null) {
         let rawRelative = currentYawRef.current - baseline;
@@ -406,12 +426,13 @@ export default function Page() {
       setActiveZone("snare");
       setHits(0);
       setLastHit(null);
-      startTimeRef.current = performance.now();
       baselineYawRef.current = null;
       setCalibrated(false);
       angleHistoryRef.current = [];
       angleSnapshotRef.current = [];
-      setMode("play");
+      sensorAliveRef.current = false;
+      setSensorAlive(false);
+      setMode("calibrate");
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setPermError(`Init error: ${msg}`);
@@ -460,6 +481,18 @@ export default function Page() {
 
   if (mode === "start") {
     return <StartScreen onPick={startWithHand} permError={permError} />;
+  }
+
+  if (mode === "calibrate") {
+    return (
+      <CalibrateScreen
+        hand={hand}
+        sensorAlive={sensorAlive}
+        onSetZero={setZero}
+        onCancel={exitToStart}
+        rawAlphaLabelRef={rawAlphaLabelRef}
+      />
+    );
   }
 
   if (mode === "setup") {
@@ -561,27 +594,6 @@ export default function Page() {
         <div className="absolute top-3 right-4 font-mono text-[10px] text-zinc-500">
           {ZONE_CODE[activeZone]}
         </div>
-
-        {!calibrated && (
-          <div className="absolute inset-0 z-20 backdrop-blur-md bg-black/60 flex flex-col items-center justify-center">
-            <div
-              className="font-display text-2xl tracking-widest"
-              style={{ color: "#fde047" }}
-            >
-              CALIBRATING
-            </div>
-            <div className="mt-2 font-mono text-xs text-zinc-400">
-              ถือมือถือให้นิ่ง · กำลังอ่านค่าเริ่มต้น
-            </div>
-            <div className="mt-4 flex gap-1">
-              <span className="w-2 h-2 rounded-full bg-snare blink-dot" />
-              <span
-                className="w-2 h-2 rounded-full bg-hihat blink-dot"
-                style={{ animationDelay: "120ms" }}
-              />
-            </div>
-          </div>
-        )}
       </section>
 
       {/* AIM Indicator with markers for SNARE + HI-HAT */}
@@ -919,6 +931,95 @@ function SetupScreen({
       >
         BACK TO PLAY
       </button>
+    </main>
+  );
+}
+
+// ----- Calibrate Zero Screen -----
+
+function CalibrateScreen({
+  hand,
+  sensorAlive,
+  onSetZero,
+  onCancel,
+  rawAlphaLabelRef,
+}: {
+  hand: Hand;
+  sensorAlive: boolean;
+  onSetZero: () => void;
+  onCancel: () => void;
+  rawAlphaLabelRef: MutableRefObject<HTMLSpanElement | null>;
+}) {
+  return (
+    <main className="grid-bg relative h-[100dvh] w-full flex flex-col px-4 pb-4 pt-3 overflow-hidden">
+      <div className="scanline" />
+
+      <header className="flex items-center justify-between gap-2 z-10">
+        <button
+          onClick={onCancel}
+          aria-label="Back to start"
+          className="font-mono text-sm w-9 h-9 border border-zinc-700 rounded hover:border-zinc-500 active:scale-95 transition"
+        >
+          ✕
+        </button>
+        <div
+          className="font-display text-base tracking-widest text-center"
+          style={{ color: "#fde047", textShadow: "0 0 12px #fde04788" }}
+        >
+          SET ZERO POINT
+        </div>
+        <div className="w-9" />
+      </header>
+
+      <div className="mt-2 text-center font-mono text-xs text-zinc-400 z-10 flex items-center justify-center gap-2">
+        <span className="text-base leading-none">{HAND_EMOJI[hand]}</span>
+        <span className="tracking-widest font-bold">{HAND_LABEL[hand]}</span>
+      </div>
+
+      <p className="mt-6 font-mono text-sm text-zinc-300 leading-relaxed text-center max-w-xs mx-auto z-10">
+        ชี้มือถือไปทาง{" "}
+        <span className="font-bold" style={{ color: "#f43f5e" }}>
+          SNARE
+        </span>
+        <br />
+        แล้วกด <span className="font-bold text-zinc-100">SET ZERO</span>
+      </p>
+
+      <section className="flex-1 flex items-center justify-center z-10">
+        <button
+          onClick={onSetZero}
+          disabled={!sensorAlive}
+          className="font-display text-2xl tracking-widest w-56 h-56 rounded-full border-4 active:scale-95 transition disabled:opacity-40 disabled:cursor-not-allowed flex flex-col items-center justify-center leading-tight"
+          style={{
+            borderColor: "#f43f5e",
+            color: "#f43f5e",
+            boxShadow: sensorAlive
+              ? "0 0 60px rgba(244,63,94,0.7), inset 0 0 32px rgba(244,63,94,0.25)"
+              : "none",
+            background: "radial-gradient(circle, #f43f5e22, transparent 70%)",
+          }}
+        >
+          <span>● SET</span>
+          <span>ZERO</span>
+        </button>
+      </section>
+
+      <div className="z-10 text-center font-mono text-[11px] text-zinc-500">
+        RAW α{" "}
+        <span ref={rawAlphaLabelRef} className="text-zinc-300">
+          0.0
+        </span>
+        °
+        {!sensorAlive && (
+          <span className="ml-2" style={{ color: "#fde047" }}>
+            · รอ sensor...
+          </span>
+        )}
+      </div>
+
+      <footer className="mt-3 text-center text-[10px] text-zinc-500 font-mono leading-relaxed z-10">
+        ทิศนี้จะเป็น 0° · ทิศอื่นจะวัดจากทิศนี้ · กด RECAL ในเกมเพื่อตั้งใหม่
+      </footer>
     </main>
   );
 }
